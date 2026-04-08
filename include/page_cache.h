@@ -22,6 +22,7 @@
 #include "nvm_parallel_queue.h"
 #include "nvm_cmd.h"
 
+#define EVKSIZE 256*1024*1024
 #define FREE 2
 // enum locality {HIGH_SPATIAL, LOW_SPATIAL, MEDIUM_SPATIAL};
 // template <typname T>
@@ -517,14 +518,17 @@ struct page_cache_d_t {
     uint64_t  range_cap;
     //uint64_t  range_count;
     pages_t*   ranges;
-    pages_t*   h_ranges;
+    evk_gpu_cache** evks;
+    // pages_t*   h_ranges;
     uint64_t n_ranges;
+    uint64_t n_evks;
     uint64_t n_ranges_bits;
     uint64_t n_ranges_mask;
     uint64_t n_cachelines_for_states;
-
+    uint64_t* evks_page_starts;
     uint64_t* ranges_page_starts;
     data_dist_t* ranges_dists;
+    data_dist_t* evk_dists;
     simt::atomic<uint64_t, simt::thread_scope_device>* ctrl_counter;
 
     simt::atomic<uint64_t, simt::thread_scope_device>* q_head;
@@ -638,6 +642,9 @@ struct page_cache_t {
     //void* d_pc;
     //BufferPtr prp2_list_buf;
     //bool prps;
+    evk_gpu_cache** evk_ranges;
+    uint64_t* evk_ranges_page_starts;
+    data_dist_t* evk_ranges_dists;
     pages_t*   h_ranges;
     uint64_t* h_ranges_page_starts;
     data_dist_t* h_ranges_dists;
@@ -651,10 +658,13 @@ struct page_cache_t {
     //BufferPtr page_translation_buf;
     //BufferPtr page_take_lock_buf;
     BufferPtr ranges_buf;
+    BufferPtr evks_buf;
     BufferPtr pc_buff;
     BufferPtr d_ctrls_buff;
     BufferPtr ranges_page_starts_buf;
+    BufferPtr evks_page_starts_buf;
     BufferPtr ranges_dists_buf;
+    BufferPtr evks_dists_buf;
 
     BufferPtr page_ticket_buf;
     BufferPtr ctrl_counter_buf;
@@ -693,7 +703,17 @@ struct page_cache_t {
         cuda_err_chk(cudaMemcpy(d_pc_ptr, &pdt, sizeof(page_cache_d_t), cudaMemcpyHostToDevice));
 
     }
+    void add_range(evkcache_t* range) {
+        range->rdt.evkcache_id  = pdt.n_evks++;
+        evk_ranges[range->rdt.evkcache_id] = range->rdt.pages;
+        evk_ranges_page_starts[range->rdt.evkcache_id] = range->rdt.page_start;
+        evk_ranges_dists[range->rdt.evkcache_id] = range->rdt.dist;
+        cuda_err_chk(cudaMemcpy(pdt.evks_page_starts, evk_ranges_page_starts, pdt.n_evks * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(pdt.evks, evk_ranges, pdt.n_evks* sizeof(evk_gpu_cache*), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(pdt.evk_dists, evk_ranges_dists, pdt.n_evks* sizeof(data_dist_t), cudaMemcpyHostToDevice));
+        cuda_err_chk(cudaMemcpy(d_pc_ptr, &pdt, sizeof(page_cache_d_t), cudaMemcpyHostToDevice));
 
+    }
     page_cache_t(const uint64_t ps, const uint64_t np, const uint32_t cudaDevice, const Controller& ctrl, const uint64_t max_range, const std::vector<Controller*>& ctrls) {
 
         ctrl_counter_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
@@ -723,21 +743,28 @@ struct page_cache_t {
         //d_ctrls = (Controller**) d_ctrls_buff.get();
         //for (size_t k = 0; k < n_ctrls; k++)
         //    cuda_err_chk(cudaMemcpy(d_ctrls+k, &(ctrls[k]->d_ctrl_ptr), sizeof(Controller*), cudaMemcpyHostToDevice));
-
+        uint64_t max_range_ = max_range/2;//max_range需要满足可以被2整除
         pdt.range_cap = max_range;
         pdt.n_ranges = 0;
+        pdt.n_evks = 0;
         pdt.n_ranges_bits = (max_range == 1) ? 1 : std::log2(max_range);
         pdt.n_ranges_mask = max_range-1;
         std::cout << "n_ranges_bits: " << std::dec << pdt.n_ranges_bits << std::endl;
         std::cout << "n_ranges_mask: " << std::dec << pdt.n_ranges_mask << std::endl;
 
         pdt.page_size_log = std::log2(ps);
-        ranges_buf = createBuffer(max_range * sizeof(pages_t), cudaDevice);
+        ranges_buf = createBuffer(max_range_ * sizeof(pages_t), cudaDevice);
         pdt.ranges = (pages_t*)ranges_buf.get();
-        h_ranges = new pages_t[max_range];
+        evks_buf = createBuffer(max_range_ * sizeof(evk_gpu_cache*),cudaDevice);
+        pdt.evks = (evk_gpu_cache**)evks_buf.get();
+        evk_ranges = new evk_gpu_cache*[max_range_];
+        evk_ranges_page_starts = new uint64_t[max_range_];
+        std::memset(evk_ranges_page_starts, 0, max_range_ * sizeof(uint64_t));
 
-        h_ranges_page_starts = new uint64_t[max_range];
-        std::memset(h_ranges_page_starts, 0, max_range * sizeof(uint64_t));
+        h_ranges = new pages_t[max_range_];
+
+        h_ranges_page_starts = new uint64_t[max_range_];
+        std::memset(h_ranges_page_starts, 0, max_range_ * sizeof(uint64_t));
 
         //pages_translation_buf = createBuffer(np * sizeof(uint32_t), cudaDevice);
         //pdt.page_translation = (uint32_t*)page_translation_buf.get();
@@ -750,8 +777,11 @@ struct page_cache_t {
         cache_pages_buf = createBuffer(np * sizeof(cache_page_t), cudaDevice);
         pdt.cache_pages = (cache_page_t*)cache_pages_buf.get();
 
-        ranges_page_starts_buf = createBuffer(max_range * sizeof(uint64_t), cudaDevice);
+        ranges_page_starts_buf = createBuffer(max_range_ * sizeof(uint64_t), cudaDevice);
         pdt.ranges_page_starts = (uint64_t*) ranges_page_starts_buf.get();
+        
+        evks_page_starts_buf = createBuffer(max_range_ * sizeof(uint64_t), cudaDevice);
+        pdt.evks_page_starts = (uint64_t*) ranges_page_starts_buf.get();
 
         page_ticket_buf = createBuffer(1 * sizeof(padded_struct_pc), cudaDevice);
         pdt.page_ticket =  (padded_struct_pc*)page_ticket_buf.get();
@@ -762,10 +792,12 @@ struct page_cache_t {
         cuda_err_chk(cudaMemcpy(pdt.cache_pages, tps, np*sizeof(cache_page_t), cudaMemcpyHostToDevice));
         delete tps;
 
-        ranges_dists_buf = createBuffer(max_range * sizeof(data_dist_t), cudaDevice);
+        ranges_dists_buf = createBuffer(max_range_ * sizeof(data_dist_t), cudaDevice);
         pdt.ranges_dists = (data_dist_t*)ranges_dists_buf.get();
-        h_ranges_dists = new data_dist_t[max_range];
-
+        evks_dists_buf = createBuffer(max_range_ * sizeof(data_dist_t), cudaDevice);
+        pdt.evk_dists = (data_dist_t*)evks_dists_buf.get();
+        h_ranges_dists = new data_dist_t[max_range_];
+        evk_ranges_dists = new data_dist_t[max_range_];
         uint64_t cache_size = ps*np;
         this->pages_dma = createDma(ctrl.ctrl, NVM_PAGE_ALIGN(cache_size, 1UL << 16), cudaDevice);
         pdt.base_addr = (uint8_t*) this->pages_dma.get()->vaddr;
@@ -878,6 +910,9 @@ struct page_cache_t {
         delete h_ranges;
         delete h_ranges_page_starts;
         delete h_ranges_dists;
+        delete evk_ranges;
+        delete evk_ranges_page_starts;
+        delete evk_ranges_dists;
     }
 
 
@@ -885,9 +920,359 @@ struct page_cache_t {
 
 
 };
+typedef struct __align__(32)
+{
+    simt::atomic<uint32_t, simt::thread_scope_device>  state; //state
+                                                              //
+    uint32_t* offset;
+    //uint8_t pad[32-4-4];
+
+} __attribute__((aligned (32))) evk_gpu_cache;
+
+struct evkcache_d_t{
+    uint64_t page_start;
+    uint64_t index_start;
+    uint64_t count;
+    uint64_t page_size;
+    uint64_t page_count;
+    uint64_t n_pages_per_ele;
+    uint64_t evkcache_id;
+    data_dist_t dist;
+    
+    simt::atomic<uint64_t, simt::thread_scope_device> access_cnt;
+    simt::atomic<uint64_t, simt::thread_scope_device> miss_cnt;
+    simt::atomic<uint64_t, simt::thread_scope_device> hit_cnt;
+    simt::atomic<uint64_t, simt::thread_scope_device> read_io_cnt;
+
+
+    evk_gpu_cache* pages;
+    //padded_struct_pc* page_addresses;
+    //uint32_t* page_addresses;
+    //padded_struct_pc* page_vals;  //len = num of pages for data
+    //void* self_ptr;
+    page_cache_d_t cache;
+    //range_d_t(range_t<T>* rt);
+    __forceinline__
+    __device__
+    uint64_t get_backing_page(const size_t i) const;
+    __forceinline__
+    __device__
+    uint64_t get_backing_ctrl(const size_t i) const;
+    __forceinline__
+    __device__
+    uint64_t get_sector_size() const;
+    __forceinline__
+    __device__
+    uint64_t get_page(const size_t i, const uint64_t offset) const;
+    __forceinline__
+    __device__
+    bool judge_pagesize() const;
+    __forceinline__
+    __device__
+    uint64_t get_global_address(const size_t page) const;
+    __forceinline__
+    __device__
+    void release_page(const size_t pg) const;
+    __forceinline__
+    __device__
+    void release_page(const size_t pg, const uint32_t count) const;
+    __forceinline__
+    __device__
+    uint64_t acquire_page(const size_t pg, const uint32_t count, const uint32_t ele_page_id,const bool write, const uint32_t ctrl, const uint32_t queue) ;
+    __forceinline__
+    __device__
+    void coalesce_page(const uint32_t lane, const uint32_t mask, const int64_t r, const uint64_t page, const uint64_t gaddr, const uint32_t ele_page_idx,const bool write,
+                       uint32_t& eq_mask, int& master, uint32_t& count, uint64_t& base_master)  ;
+    __forceinline__
+    __device__
+    cache_page_t* get_cache_page(const size_t pg) const;
+    __forceinline__
+    __device__
+    uint64_t get_cache_page_addr(const uint32_t page_trans) const;
+    __forceinline__
+    __device__
+    void read_evkcache(char* waiting_buf,uint64_t page_start, uint64_t bytes_num, uint64_t offset, uint32_t ele_in_page);
+};
+
+struct evkcache_t{
+    evkcache_d_t rdt;
+    evkcache_d_t* d_evkcache_ptr;
+    page_cache_d_t* cache;
+    BufferPtr evkcache_buff;
+    //BufferPtr page_addresses_buff;
+    BufferPtr range_buff;
+    evkcache_t(uint64_t is, uint64_t count, uint64_t ps, uint64_t pc,  page_cache_t* c_h, uint32_t cudaDevice, data_dist_t dist = REPLICATE);
+};
+
+evkcache_t::evkcache_t(uint64_t is, uint64_t count, uint64_t ps, uint64_t pc,  page_cache_t* c_h, uint32_t cudaDevice, data_dist_t dist = REPLICATE){
+    rdt.access_cnt = 0;
+    rdt.miss_cnt = 0;
+    rdt.hit_cnt = 0;
+    rdt.read_io_cnt = 0;
+    rdt.index_start = is;
+    rdt.count = count;
+    //range_id = (c_h->range_count)++;
+    rdt.page_start = ps;
+    rdt.page_count = pc;
+    rdt.page_size = c_h->pdt.page_size;
+
+    rdt.dist = dist;
+    size_t s = count;//(rdt.page_end-rdt.page_start);//*page_size / c_h->page_size;
+    rdt.n_pages_per_ele = EVKSIZE/rdt.page_size ;
+    cache = (page_cache_d_t*) c_h->d_pc_ptr;
+    evkcache_buff = createBuffer(s * sizeof(evk_gpu_cache), cudaDevice);
+    rdt.pages = (evk_gpu_cache*) evkcache_buff.get();
+    for(uint64_t i = 0; i < s; ++i) {
+    uint32_t* d_offset = nullptr;
+    cuda_err_chk(cudaMalloc(&d_offset, rdt.n_pages_per_ele * sizeof(uint32_t)));
+    cuda_err_chk(cudaMemcpy(&rdt.pages[i].offset, &d_offset, sizeof(uint32_t*), 
+               cudaMemcpyHostToDevice));
+    simt::atomic<uint32_t, simt::thread_scope_device> tt;
+    tt=INVALID;
+    cuda_err_chk(cudaMemcpy(&rdt.pages[i].state,&tt,sizeof(simt::atomic<uint32_t, simt::thread_scope_device>),cudaMemcpyHostToDevice));
+}
+    
+    
+
+    //page_addresses_buff = createBuffer(s * sizeof(uint32_t), cudaDevice);
+    //rdt.page_addresses = (uint32_t*) page_addresses_buff.get();
+    //page_addresses_buff = createBuffer(s * sizeof(padded_struct_pc), cudaDevice);
+    //page_addresses = (padded_struct_pc*) page_addresses_buff.get();
+
+    range_buff = createBuffer(sizeof(evkcache_d_t), cudaDevice);
+    d_evkcache_ptr = (evkcache_d_t*)range_buff.get();
+    //rdt.range_id  = c_h->pdt.n_ranges++;
+
+
+    cuda_err_chk(cudaMemcpy(d_evkcache_ptr, &rdt, sizeof(evkcache_d_t), cudaMemcpyHostToDevice));
+
+    c_h->add_range(this);
+
+    rdt.cache = c_h->pdt;
+    cuda_err_chk(cudaMemcpy(d_evkcache_ptr, &rdt, sizeof(evkcache_d_t), cudaMemcpyHostToDevice));
+}
+
+    __forceinline__
+    __device__
+    uint64_t evkcache_d_t::get_backing_page(const size_t page_offset) const{
+     return get_backing_page_(page_start, page_offset, cache.n_ctrls, dist);
+}
+    __forceinline__
+    __device__
+    uint64_t evkcache_d_t::get_backing_ctrl(const size_t page_offset) const{
+        return get_backing_ctrl_(page_offset, cache.n_ctrls, dist);
+    }
+    __forceinline__
+    __device__
+    uint64_t evkcache_d_t::get_sector_size() const{
+        return page_size;
+    }
+    __forceinline__
+    __device__
+    uint64_t evkcache_d_t::get_page(const size_t i, const uint64_t offset) const{
+       uint64_t index = ((i - index_start) * EVKSIZE + offset) >> (cache.page_size_log);
+       return index;
+    }
+    __forceinline__
+    __device__
+    bool evkcache_d_t::judge_pagesize() const{
+        return (EVKSIZE%page_size==0) ? 1 : 0;
+    }
+    __forceinline__
+    __device__
+    uint64_t evkcache_d_t::get_cache_page_addr(const uint32_t page_trans) const{
+        return ((uint64_t)((cache.base_addr+(page_trans * cache.page_size))));
+    }
+    __forceinline__
+    __device__
+    uint64_t evkcache_d_t::get_global_address(const size_t page) const{
+        return ((page << cache.n_ranges_bits) | (evkcache_id + cache.range_cap/2));
+    } 
+    __forceinline__
+    __device__
+void evkcache_d_t::release_page(const size_t pg) const{
+    uint64_t index = pg;
+    pages[index].state.fetch_sub(1, simt::memory_order_release);
+
+}
+    __forceinline__
+    __device__
+void evkcache_d_t::release_page(const size_t pg, const uint32_t count) const{
+uint64_t index = pg;
+    pages[index].state.fetch_sub(count, simt::memory_order_release);
+
+    }
+    __forceinline__
+    __device__
+uint64_t evkcache_d_t::acquire_page(const size_t pg, const uint32_t count, const uint32_t ele_page_id,const bool write, const uint32_t ctrl, const uint32_t queue) {
+    uint64_t index = pg;
+    //uint32_t global_address = (index << cache.n_ranges_bits) | range_id;
+    //access_cnt.fetch_add(count, simt::memory_order_relaxed);
+    access_cnt.fetch_add(count, simt::memory_order_relaxed);
+    bool fail = true;
+    unsigned int ns = 8;
+    //bool miss = false;
+    //T ret;
+    uint64_t read_state,st,st_new;
+    read_state = pages[index].state.fetch_add(count, simt::memory_order_acquire);
+    do {
+        st = (read_state >> (CNT_SHIFT+1)) & 0x03;
+
+        switch (st) {
+            //invalid
+        case NV_NB:
+            st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
+            if ((st_new & BUSY) == 0) {
+                
+                uint32_t page_trans = cache.find_slot(index, evkcache_id+cache.range_cap/2, queue);
+                //fill in
+                //uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+                //uint32_t sm_id = get_smid();
+                //uint32_t ctrl = (tid/32) % (cache.n_ctrls);
+                //uint32_t ctrl = sm_id % (cache.n_ctrls);
+                //uint32_t ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+                uint64_t ctrl = get_backing_ctrl(index);
+                if (ctrl == ALL_CTRLS)
+                    ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+                //ctrl = ctrl_;
+                uint64_t b_page = get_backing_page(index);
+                Controller* c = cache.d_ctrls[ctrl];
+                c->access_counter.fetch_add(1, simt::memory_order_relaxed);
+                //uint32_t queue = (tid/32) % (c->n_qps);
+                //uint32_t queue = c->queue_counter.fetch_add(1, simt::memory_order_relaxed) % (c->n_qps);
+                //uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
+                read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
+                read_data(&cache, (c->d_qps)+queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans);
+                //page_addresses[index].store(page_trans, simt::memory_order_release);
+                pages[index].offset[ele_page_id] = page_trans;
+                // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+                //     __nanosleep(100);
+                //miss_cnt.fetch_add(count, simt::memory_order_relaxed);
+                miss_cnt.fetch_add(count, simt::memory_order_relaxed);
+                //new_state = VALID;
+                if (write)
+                    pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+                //new_state |= DIRTY;
+                //pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
+                pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
+                return page_trans;
+
+                fail = false;
+            }
+
+            break;
+            //valid
+        case V_NB:
+            if (write && ((read_state & DIRTY) == 0))
+                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+            //uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
+            uint32_t page_trans = pages[index].offset[ele_page_id];
+            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+            //     __nanosleep(100);
+            //hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+            return page_trans;
+
+            //pages[index].fetch_sub(1, simt::memory_order_release);
+            fail = false;
+
+            break;
+        case NV_B:
+        case V_B:
+        default:
+            break;
 
 
 
+         
+        }
+        if (fail) {
+            //if ((++j % 1000000) == 0)
+            //    printf("failed to acquire_page: j: %llu\tcnt_shift+1: %llu\tpage: %llu\tread_state: %llx\tst: %llx\tst_new: %llx\n", (unsigned long long)j, (unsigned long long) (CNT_SHIFT+1), (unsigned long long) index, (unsigned long long)read_state, (unsigned long long)st, (unsigned long long)st_new);
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+            __nanosleep(ns);
+            if (ns < 256) {
+                ns *= 2;
+            }
+#endif
+            read_state = pages[index].state.load(simt::memory_order_acquire);
+        }
+
+    } while (fail);
+    return 0;
+    }
+__forceinline__
+__device__
+void evkcache_d_t::coalesce_page(const uint32_t lane, const uint32_t mask, const int64_t r, const uint64_t page, const uint64_t gaddr, const uint32_t ele_page_idx,const bool write,
+                       uint32_t& eq_mask, int& master, uint32_t& count, uint64_t& base_master) {
+        uint32_t ctrl;
+        uint32_t queue;
+        uint32_t leader = __ffs(mask) - 1;
+        
+        if (lane == leader) {
+            
+            ctrl = 0;//pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+            queue = get_smid() % (cache.d_ctrls[0]->n_qps);
+        }
+
+        ctrl = 0; //__shfl_sync(mask, ctrl, leader);
+        queue = __shfl_sync(mask, queue, leader);
+
+
+        uint32_t active_cnt = __popc(mask);
+        eq_mask = __match_any_sync(mask, gaddr);
+        eq_mask &= __match_any_sync(mask, (uint64_t)this);
+        master = __ffs(eq_mask) - 1;
+
+        uint32_t dirty = __any_sync(eq_mask, write);
+
+        uint64_t base;
+        //bool memcpyflag_master;
+        //bool memcpyflag;
+        count = __popc(eq_mask);
+        if (master == lane) {
+            //std::pair<uint64_t, bool> base_memcpyflag;
+            base = acquire_page(page, count, ele_page_idx,dirty, ctrl, queue);
+            base_master = base;
+//                //printf("++tid: %llu\tbase: %p  page:%llu\n", (unsigned long long) threadIdx.x, base_master, (unsigned long long) page);
+        }
+        base_master = __shfl_sync(eq_mask,  base_master, master);
+    }
+__forceinline__
+__device__
+void evkcache_d_t::read_evkcache( char* waiting_buf, uint64_t page_start, uint64_t bytes_num,uint64_t offset, uint32_t ele_page_id) {
+   uint32_t lane = lane_id();//ele_page_id表示这是这个EVk Key在ssd上的第几个page
+   uint32_t mask = __activemask();
+   uint32_t eq_mask;
+   int master;
+   uint64_t base_master;
+   uint32_t count;
+   uint64_t gaddr = get_global_address(page_start);
+   if((bytes_num % page_size!=0)&&(bytes_num>page_size)){
+    perror("Need to be whole page");
+    exit(EXIT_FAILURE); 
+}    
+   if(bytes_num>page_size){
+    uint64_t page_num = bytes_num/page_size;
+ 
+    uint32_t ctrl = 0;
+    uint32_t queue = get_smid()%(cache.d_ctrls[ctrl]->n_qps);
+    for(uint32_t k = 0;k< page_num;++k){
+        uint64_t pg = page_start + k;
+        uint64_t page_trans = acquire_page(pg,1,ele_page_id,false,ctrl,queue);
+        const char* src = (char*)(get_cache_page_addr(page_trans));
+        char* dst = waiting_buf + offset + k*page_size; 
+        for(uint64_t b=0;b<page_size;++b){
+            dst[b]=src[b];
+        }  
+        release_page(pg,1); 
+    } 
+   }
+
+   else{
+    coalesce_page(lane,mask,0,page_start,gaddr,ele_page_id,false,eq_mask,master,count,base_master);
+   }
+}
 template <typename T>
 struct range_d_t {
     uint64_t index_start;
@@ -1138,47 +1523,41 @@ uint64_t range_d_t<T>::acquire_page(const size_t pg, const uint32_t count, const
         case NV_NB:
             st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
             if ((st_new & BUSY) == 0) {
-                uint64_t st_new_st = (st_new >> (CNT_SHIFT+1)) & 0x03;
-                if (st_new_st == NV_NB) { 
-                    uint32_t page_trans = cache.find_slot(index, range_id, queue);
-                    //fill in
-                    //uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-                    //uint32_t sm_id = get_smid();
-                    //uint32_t ctrl = (tid/32) % (cache.n_ctrls);
-                    //uint32_t ctrl = sm_id % (cache.n_ctrls);
-                    //uint32_t ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
-                    uint64_t ctrl = get_backing_ctrl(index);
-                    if (ctrl == ALL_CTRLS)
-                        ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
-                    //ctrl = ctrl_;
-                    uint64_t b_page = get_backing_page(index);
-                    Controller* c = cache.d_ctrls[ctrl];
-                    c->access_counter.fetch_add(1, simt::memory_order_relaxed);
-                    //uint32_t queue = (tid/32) % (c->n_qps);
-                    //uint32_t queue = c->queue_counter.fetch_add(1, simt::memory_order_relaxed) % (c->n_qps);
-                    //uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
-                    read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
-                    read_data(&cache, (c->d_qps)+queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans);
-                    //page_addresses[index].store(page_trans, simt::memory_order_release);
-                    pages[index].offset = page_trans;
-                    // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
-                    //     __nanosleep(100);
-                    //miss_cnt.fetch_add(count, simt::memory_order_relaxed);
-                    miss_cnt.fetch_add(count, simt::memory_order_relaxed);
-                    //new_state = VALID;
-                    if (write)
-                        pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
-                    //new_state |= DIRTY;
-                    //pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
-                    pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
-                    return page_trans;
-    
-                    fail = false;
-                } else {
-                    // Another thread beat us to load the page in cache, clear the BUSY bit and retry.
-                    pages[index].state.fetch_and(DISABLE_BUSY_MASK, simt::memory_order_release);
-                    printf("Race loading page\n");
-                }
+                
+                uint32_t page_trans = cache.find_slot(index, range_id, queue);
+                //fill in
+                //uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+                //uint32_t sm_id = get_smid();
+                //uint32_t ctrl = (tid/32) % (cache.n_ctrls);
+                //uint32_t ctrl = sm_id % (cache.n_ctrls);
+                //uint32_t ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+                uint64_t ctrl = get_backing_ctrl(index);
+                if (ctrl == ALL_CTRLS)
+                    ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
+                //ctrl = ctrl_;
+                uint64_t b_page = get_backing_page(index);
+                Controller* c = cache.d_ctrls[ctrl];
+                c->access_counter.fetch_add(1, simt::memory_order_relaxed);
+                //uint32_t queue = (tid/32) % (c->n_qps);
+                //uint32_t queue = c->queue_counter.fetch_add(1, simt::memory_order_relaxed) % (c->n_qps);
+                //uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
+                read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
+                read_data(&cache, (c->d_qps)+queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans);
+                //page_addresses[index].store(page_trans, simt::memory_order_release);
+                pages[index].offset = page_trans;
+                // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
+                //     __nanosleep(100);
+                //miss_cnt.fetch_add(count, simt::memory_order_relaxed);
+                miss_cnt.fetch_add(count, simt::memory_order_relaxed);
+                //new_state = VALID;
+                if (write)
+                    pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+                //new_state |= DIRTY;
+                //pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
+                pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
+                return page_trans;
+
+                fail = false;
             }
 
             break;
@@ -1781,12 +2160,13 @@ cache_page_t* page_cache_d_t::get_cache_page(const uint32_t page) const {
 
 
 
+
 __forceinline__
 __device__
 uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const uint32_t queue_) {
     bool fail = true;
     uint64_t count = 0;
-    uint64_t global_address =(uint64_t) ((address << n_ranges_bits) | range_id); //not elegant. but hack
+    uint32_t global_address =(uint32_t) ((address << n_ranges_bits) | range_id); //not elegant. but hack
     uint32_t page = 0;
     unsigned int ns = 8;
 	uint64_t j = 0;
@@ -1825,14 +2205,15 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
         }
         //assigned to someone and was able to take lock
         else if ( v == UNLOCKED ) {
+            if(range_id < range_cap/2){
 
             lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
             if (lock) {
                 //uint32_t previous_address = this->cache_pages[page].page_translation;
-                uint64_t previous_global_address = this->cache_pages[page].page_translation;
+                uint32_t previous_global_address = this->cache_pages[page].page_translation;
                 //uint8_t previous_range = this->cache_pages[page].range_id;
-                uint64_t previous_range = previous_global_address & n_ranges_mask;
-                uint64_t previous_address = previous_global_address >> n_ranges_bits;
+                uint32_t previous_range = previous_global_address & n_ranges_mask;
+                uint32_t previous_address = previous_global_address >> n_ranges_bits;
                 //uint32_t new_state = BUSY;
                 //if ((previous_range >= range_cap) || (previous_address >= n_pages))
                 //    //printf("prev_ga: %llu\tprev_range: %llu\tprev_add: %llu\trange_cap: %llu\tn_pages: %llu\n", (unsigned long long) previous_global_address, (unsigned long long) previous_range, (unsigned long long) previous_address,
@@ -1896,7 +2277,78 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
                 this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
             }
 
+        }
+        else{
+            lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
+            if (lock) {
+                //uint32_t previous_address = this->cache_pages[page].page_translation;
+                uint32_t previous_global_address = this->cache_pages[page].page_translation;
+                //uint8_t previous_range = this->cache_pages[page].range_id;
+                uint32_t previous_range = previous_global_address & n_ranges_mask - range_cap/2;
+                uint32_t previous_address = previous_global_address >> n_ranges_bits;
+                //uint32_t new_state = BUSY;
+                //if ((previous_range >= range_cap) || (previous_address >= n_pages))
+                //    //printf("prev_ga: %llu\tprev_range: %llu\tprev_add: %llu\trange_cap: %llu\tn_pages: %llu\n", (unsigned long long) previous_global_address, (unsigned long long) previous_range, (unsigned long long) previous_address,
+                //           (unsigned long long) range_cap, (unsigned long long) n_pages);
+                expected_state = this->evks[previous_range][previous_address].state.load(simt::memory_order_relaxed);
 
+                uint32_t cnt = expected_state & CNT_MASK;
+                uint32_t b = expected_state & BUSY;
+                if ((cnt == 0) && (b == 0) ) {
+                    new_expected_state = this->evks[previous_range][previous_address].state.fetch_or(BUSY, simt::memory_order_acquire);
+                    if (((new_expected_state & BUSY ) == 0) ) {
+                        //while ((new_expected_state & CNT_MASK ) != 0) new_expected_state = this->ranges[previous_range][previous_address].state.load(simt::memory_order_acquire);
+                        if (((new_expected_state & CNT_MASK ) == 0) ) {
+                            if ((new_expected_state & DIRTY)) {
+                                uint64_t ctrl = get_backing_ctrl_(previous_address, n_ctrls, evk_dists[previous_range]);
+                                //uint64_t get_backing_page(const uint64_t page_start, const size_t page_offset, const uint64_t n_ctrls, const data_dist_t dist) {
+                                uint64_t index = get_backing_page_(evks_page_starts[previous_range], previous_address, n_ctrls, evk_dists[previous_range]);
+                                // //printf("Eviciting range_id: %llu\tpage_id: %llu\tctrl: %llx\tindex: %llu\n",
+                                //        (unsigned long long) previous_range, (unsigned long long)previous_address,
+                                //        (unsigned long long) ctrl, (unsigned long long) index);
+                                if (ctrl == ALL_CTRLS) {
+                                    for (ctrl = 0; ctrl < n_ctrls; ctrl++) {
+                                        Controller* c = this->d_ctrls[ctrl];
+                                        uint32_t queue = queue_ % (c->n_qps);
+                                        write_data(this, (c->d_qps)+queue, (index*this->n_blocks_per_page), this->n_blocks_per_page, page);
+                                    }
+                                }
+                                else {
+
+                                    Controller* c = this->d_ctrls[ctrl];
+                                    uint32_t queue = queue_ % (c->n_qps);
+
+                                    //index = ranges_page_starts[previous_range] + previous_address;
+
+
+                                    write_data(this, (c->d_qps)+queue, (index*this->n_blocks_per_page), this->n_blocks_per_page, page);
+                                }
+                            }
+
+                            fail = false;
+                            this->evks[previous_range][previous_address].state.fetch_and(CNT_MASK, simt::memory_order_release);
+                        }
+                        else { 
+                            this->evks[previous_range][previous_address].state.fetch_and(DISABLE_BUSY_MASK, simt::memory_order_release);
+//if ((j % 1000000) == 0) {
+//                printf("failed to find slot j: %llu\taddr: %llx\tpage: %llx\texpected_state: %llx\tnew_expected_date: %llx\n", (unsigned long long) j, (unsigned long long) address, (unsigned long long)page, (unsigned long long) expected_state, (unsigned long long) new_expected_state);
+//}
+                        }
+                    }
+                }
+
+                //this->ranges[previous_range][previous_address].compare_exchange_strong(expected_state, new_state, simt::memory_order_acquire, simt::memory_order_relaxed);
+
+                if (!fail) {
+                    //this->cache_pages[page].page_translation = address;
+                    //this->cache_pages[page].range_id = range_id;
+//                    this->page_translation[page] = global_address;
+                    this->cache_pages[page].page_translation = global_address;
+                }
+                //this->page_translation[page].store(global_address, simt::memory_order_release);
+                this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
+            }
+        }
         }
 
         count++;
